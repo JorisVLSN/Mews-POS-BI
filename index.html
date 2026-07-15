@@ -550,7 +550,13 @@ async function loadData() {
   try {
     // Probe the proxy to find out if MEWS_POS_TOKEN is configured server-side.
     // The proxy returns { demo: true } when the token is missing.
-    const probe = await fetch('/api/proxy?path=invoices&page[size]=1').then(r=>r.json()).catch(()=>({demo:true}));
+    // Probe the proxy — if MEWS_POS_TOKEN is not set it returns {demo:true}
+    // If the function itself 404s or throws, treat as demo
+    let probe = { demo: true };
+    try {
+      const probeRes = await fetch('/api/proxy?path=invoices&page%5Bsize%5D=1');
+      probe = await probeRes.json();
+    } catch(e) { /* network error — stay on demo */ }
     CFG.useDemoData = !!probe.demo;
     updatePropBadge();
 

@@ -1,5 +1,11 @@
 {
   "rewrites": [
+    { "source": "/", "destination": "/index.html" },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
-  ]
+  ],
+  "functions": {
+    "api/proxy.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
 }
