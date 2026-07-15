@@ -566,25 +566,42 @@ async function loadData() {
       STATE.orders = d.orders;
       STATE.trendData = generateTrendData(STATE.trendDays);
       showStatus('demo');
+      renderCurrentPage();
     } else {
-      await fetchRealData();
-      showStatus('ok');
+      try {
+        await fetchRealData();
+        showStatus('ok');
+        renderCurrentPage();
+      } catch(e) {
+        // Real API failed — show the actual error and fall back to demo data
+        const d = generateDemoData(STATE.date);
+        STATE.invoices = d.invoices;
+        STATE.orders = d.orders;
+        STATE.trendData = generateTrendData(STATE.trendDays);
+        renderCurrentPage();
+        showStatus('apierror', e.message);
+      }
     }
-    renderCurrentPage();
   } catch(e) {
-    showStatus('error', e.message);
+    // Probe or setup failed — fall back to demo silently
+    const d = generateDemoData(STATE.date);
+    STATE.invoices = d.invoices;
+    STATE.orders = d.orders;
+    STATE.trendData = generateTrendData(STATE.trendDays);
+    renderCurrentPage();
+    showStatus('apierror', e.message);
   }
 }
 function showStatus(type, msg='') {
   const el = document.getElementById('statusBar');
   if(type==='ok'||type==='loading') { el.innerHTML=''; return; }
-  const cls = type==='demo'?'status-bar':type==='error'?'status-bar err':'status-bar';
-  const icon = type==='demo'
-    ? `<svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5"/><path d="M7 4v3m0 2v.5"/></svg>`
-    : `<svg viewBox="0 0 14 14"><path d="M7 1l6 11H1L7 1zM7 6v3m0 2v.5"/></svg>`;
-  el.innerHTML = type==='demo'
-    ? `<div class="${cls}">${icon} Running on demo data — <code>MEWS_POS_TOKEN</code> not set in Vercel environment variables.</div>`
-    : `<div class="${cls}">${icon} Error: ${msg}</div>`;
+  if(type==='demo') {
+    el.innerHTML = `<div class="status-bar"><svg viewBox="0 0 14 14"><circle cx="7" cy="7" r="5"/><path d="M7 4v3m0 2v.5"/></svg> Running on demo data — <code>MEWS_POS_TOKEN</code> not set in Vercel environment variables.</div>`;
+  } else if(type==='apierror') {
+    el.innerHTML = `<div class="status-bar err"><svg viewBox="0 0 14 14"><path d="M7 1l6 11H1L7 1zM7 6v3m0 2v.5"/></svg> API error (showing demo data): ${msg}</div>`;
+  } else {
+    el.innerHTML = `<div class="status-bar err"><svg viewBox="0 0 14 14"><path d="M7 1l6 11H1L7 1zM7 6v3m0 2v.5"/></svg> Error: ${msg}</div>`;
+  }
 }
 
 async function fetchRealData() {
@@ -597,11 +614,12 @@ async function fetchRealData() {
   // The token lives in MEWS_POS_TOKEN on Vercel — never sent to the browser.
   async function fetchAll(endpoint, params) {
     const qs = new URLSearchParams(params).toString();
-    const url = `/api/proxy?path=${endpoint}&${qs}`;
+    const url = '/api/proxy?path=' + endpoint + '&' + qs;
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`Proxy ${res.status}: ${await res.text()}`);
-    const json = await res.json();
-    if (json.demo) throw new Error(json.error);
+    const json = await res.json().catch(() => ({ error: 'HTTP ' + res.status }));
+    if (json.demo) throw new Error('Token not configured: ' + json.error);
+    if (json.error) throw new Error('Mews API: ' + json.error);
+    if (!res.ok) throw new Error('Proxy error ' + res.status);
     return { data: json.data||[], included: json.included||[] };
   }
 
