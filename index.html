@@ -550,11 +550,11 @@ async function loadData() {
   try {
     // Probe the proxy to find out if MEWS_POS_TOKEN is configured server-side.
     // The proxy returns { demo: true } when the token is missing.
-    // Probe the proxy — if MEWS_POS_TOKEN is not set it returns {demo:true}
-    // If the function itself 404s or throws, treat as demo
+    // Probe the proxy with today's date — only checking if token is configured
     let probe = { demo: true };
     try {
-      const probeRes = await fetch('/api/proxy?path=invoices&page%5Bsize%5D=1');
+      const today = new Date().toISOString().slice(0,10);
+      const probeRes = await fetch('/api/proxy?path=invoices&page%5Bsize%5D=1&filter%5BcreatedAtGteq%5D=' + today + 'T00%3A00%3A00Z');
       probe = await probeRes.json();
     } catch(e) { /* network error — stay on demo */ }
     CFG.useDemoData = !!probe.demo;
@@ -605,11 +605,6 @@ function showStatus(type, msg='') {
 }
 
 async function fetchRealData() {
-  const start = STATE.date + 'T00:00:00Z';
-  const end = STATE.date + 'T23:59:59Z';
-  const prevStart = prevDayISO(STATE.date) + 'T00:00:00Z';
-  const prevEnd = prevDayISO(STATE.date) + 'T23:59:59Z';
-
   // Always route through the Vercel serverless proxy.
   // The token lives in MEWS_POS_TOKEN on Vercel — never sent to the browser.
   async function fetchAll(endpoint, params) {
@@ -623,51 +618,82 @@ async function fetchRealData() {
     return { data: json.data||[], included: json.included||[] };
   }
 
-  const invoiceParams = {
-    'include': 'invoiceItems,user,register,revenueCenter',
-    'filter[createdAtGteq]': start,
-    'filter[createdAtLteq]': end,
-    'page[size]': 1000
-  };
-  const [invToday, ordToday] = await Promise.all([
-    fetchAll('invoices', invoiceParams),
-    fetchAll('orders', {
-      'include': 'invoice,revenueCenter,outlet',
+  // Fetch invoices for a date range — no include param, we fetch related data separately
+  async function fetchInvoicesForDate(dateISO) {
+    const start = dateISO + 'T00:00:00Z';
+    const end = dateISO + 'T23:59:59Z';
+    const result = await fetchAll('invoices', {
       'filter[createdAtGteq]': start,
       'filter[createdAtLteq]': end,
       'page[size]': 1000
+    });
+    return result;
+  }
+
+  const targetDate = STATE.date;
+  const prevDate = prevDayISO(targetDate);
+  let invToday = await fetchInvoicesForDate(targetDate);
+  const [invPrev, ordToday] = await Promise.all([
+    fetchInvoicesForDate(prevDate),
+    fetchAll('orders', {
+      'filter[createdAtGteq]': targetDate + 'T00:00:00Z',
+      'filter[createdAtLteq]': targetDate + 'T23:59:59Z',
+      'page[size]': 1000
     })
   ]);
-  const [invPrev] = await Promise.all([
-    fetchAll('invoices', {...invoiceParams, 'filter[createdAtGteq]':prevStart, 'filter[createdAtLteq]':prevEnd})
-  ]);
 
-  STATE.invoices = { today: parseInvoices(invToday), prev: parseInvoices(invPrev) };
+  // Fetch users and revenue centers to resolve names (API doesn't sideload via include)
+  const [usersResp, rcResp] = await Promise.all([
+    fetchAll('users', { 'page[size]': 200 }).catch(() => ({ data: [], included: [] })),
+    fetchAll('revenue-centers', { 'page[size]': 200 }).catch(() => ({ data: [], included: [] }))
+  ]);
+  const userMap = {};
+  (usersResp.data || []).forEach(u => {
+    userMap[u.id] = u.attributes?.name || u.attributes?.email || 'Staff';
+  });
+  const rcMap = {};
+  (rcResp.data || []).forEach(rc => {
+    rcMap[rc.id] = rc.attributes?.name || 'Other';
+  });
+
+  STATE.invoices = {
+    today: parseInvoices(invToday, userMap, rcMap),
+    prev: parseInvoices(invPrev, userMap, rcMap)
+  };
   STATE.orders = { today: parseOrders(ordToday) };
 
-  // Trend data
+  // Trend data — walk back from targetDate
   const trendInvs = [];
-  for (let i=STATE.trendDays-1; i>=0; i--) {
-    const dt = new Date(); dt.setDate(dt.getDate()-i);
-    const d = dt.toISOString().slice(0,10);
-    trendInvs.push(fetchAll('invoices', {
-      'include': 'invoiceItems,revenueCenter',
-      'filter[createdAtGteq]': d+'T00:00:00Z',
-      'filter[createdAtLteq]': d+'T23:59:59Z',
-      'page[size]': 1000
-    }).then(r => ({date:d,...aggregateDay(parseInvoices(r))})));
+  for (let i = STATE.trendDays - 1; i >= 0; i--) {
+    const dt = new Date(targetDate + 'T12:00:00Z');
+    dt.setDate(dt.getDate() - i);
+    const d = dt.toISOString().slice(0, 10);
+    trendInvs.push(
+      fetchInvoicesForDate(d).then(r => ({ date: d, ...aggregateDay(parseInvoices(r, {}, {})) }))
+    );
   }
   STATE.trendData = await Promise.all(trendInvs);
 }
 
-function parseInvoices({data, included}) {
+function parseInvoices({data, included}, userMap={}, rcMap={}) {
+  // Also support legacy sideloaded included array
   const includedMap = {};
   if(included) included.forEach(r => { includedMap[r.id] = r; });
   return (data||[]).map(inv => {
     const attr = inv.attributes||{};
     const rels = inv.relationships||{};
-    const user = rels.user?.data?.id ? includedMap[rels.user.data.id] : null;
-    const rc = rels.revenueCenter?.data?.id ? includedMap[rels.revenueCenter.data.id] : null;
+    const userId = rels.user?.data?.id;
+    const rcId = rels.revenueCenter?.data?.id;
+    // Resolve name from dedicated map first, then sideloaded included, then UUID short form
+    const serverName = (userId && userMap[userId])
+      || (userId && includedMap[userId]?.attributes?.name)
+      || (userId ? userId.slice(0,8) : 'Unknown');
+    const rcName = (rcId && rcMap[rcId])
+      || (rcId && includedMap[rcId]?.attributes?.name)
+      || 'Other';
+    // Keep for legacy path below
+    const user = userId ? includedMap[userId] : null;
+    const rc = rcId ? includedMap[rcId] : null;
     const items = (rels.invoiceItems?.data||[]).map(r => {
       const item = includedMap[r.id];
       return item ? {
@@ -693,8 +719,8 @@ function parseInvoices({data, included}) {
       cancelled: attr.cancelled||false,
       cancelReason: attr.cancelReason||'',
       createdAt: attr.createdAt,
-      serverName: user?.attributes?.name||'Unknown',
-      revenueCenterName: rc?.attributes?.name||'Other',
+      serverName: serverName,
+      revenueCenterName: rcName,
       items
     };
   }).filter(inv => !inv.cancelled);
